@@ -1,0 +1,2026 @@
+MNIST_CNN_FPGA - COMPLETE SOURCE LISTING
+================================================================================
+
+FILE: rtl/sync_ram_1r1w.v
+EXPLANATION: Synchronous one-read/one-write RAM used for image and activation buffers.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+
+// Simple synchronous one-read/one-write RAM.
+// The read data is registered with one clock of latency.
+module sync_ram_1r1w #(
+    parameter DATA_WIDTH = 8,
+    parameter ADDR_WIDTH = 10,
+    parameter DEPTH      = 784
+) (
+    input  wire                  clk,
+    input  wire                  we,
+    input  wire [ADDR_WIDTH-1:0] waddr,
+    input  wire [DATA_WIDTH-1:0] wdata,
+    input  wire [ADDR_WIDTH-1:0] raddr,
+    output reg  [DATA_WIDTH-1:0] rdata
+);
+    reg [DATA_WIDTH-1:0] mem [0:DEPTH-1];
+
+    always @(posedge clk) begin
+        if (we)
+            mem[waddr] <= wdata;
+        rdata <= mem[raddr];
+    end
+endmodule
+
+================================================================================
+
+FILE: rtl/conv_engine.v
+EXPLANATION: Reusable sequential 3x3 convolution MAC engine with padding, ReLU, shift, and saturation.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+
+// Generic 3x3, stride-1, padding-1 convolution engine.
+// - UINT8 input activation
+// - INT8 weight
+// - INT32 bias/accumulator
+// - ReLU + arithmetic right shift + UINT8 saturation
+// - One MAC result is consumed every two clocks (request/read then MAC)
+module conv_engine #(
+    parameter IN_W           = 28,
+    parameter IN_H           = 28,
+    parameter IN_CH          = 1,
+    parameter OUT_CH         = 8,
+    parameter OUT_SHIFT      = 8,
+    parameter SRC_ADDR_WIDTH = 10,
+    parameter DST_ADDR_WIDTH = 13,
+    parameter WEIGHT_COUNT   = 72,
+    parameter BIAS_COUNT     = 8,
+    parameter WEIGHT_FILE    = "conv1_weights.hex",
+    parameter BIAS_FILE      = "conv1_biases.hex"
+) (
+    input  wire                      clk,
+    input  wire                      rst,
+    input  wire                      start,
+    output reg                       busy,
+    output reg                       done,
+
+    output reg  [SRC_ADDR_WIDTH-1:0] src_addr,
+    input  wire [7:0]                src_data,
+
+    output reg                       dst_we,
+    output reg  [DST_ADDR_WIDTH-1:0] dst_addr,
+    output reg  [7:0]                dst_data,
+
+    output wire signed [31:0]        debug_acc
+);
+    reg signed [7:0]  weights [0:WEIGHT_COUNT-1];
+    reg signed [31:0] biases  [0:BIAS_COUNT-1];
+    reg signed [7:0]  weight_q;
+    reg signed [31:0] accumulator;
+
+    integer out_ch_idx;
+    integer out_row;
+    integer out_col;
+    integer in_ch_idx;
+    integer kernel_row;
+    integer kernel_col;
+
+    integer input_row_calc;
+    integer input_col_calc;
+    integer source_index_calc;
+    integer weight_index_calc;
+    integer dest_index_calc;
+    reg     tap_valid;
+
+    localparam ST_IDLE  = 3'd0;
+    localparam ST_INIT  = 3'd1;
+    localparam ST_REQ   = 3'd2;
+    localparam ST_MAC   = 3'd3;
+    localparam ST_WRITE = 3'd4;
+    reg [2:0] state;
+
+    wire signed [8:0] activation_signed = $signed({1'b0, src_data});
+    wire signed [16:0] mac_product = activation_signed * weight_q;
+    wire signed [31:0] shifted_acc = accumulator >>> OUT_SHIFT;
+    wire last_tap = (in_ch_idx == IN_CH-1) &&
+                    (kernel_row == 2) && (kernel_col == 2);
+    wire last_output = (out_ch_idx == OUT_CH-1) &&
+                       (out_row == IN_H-1) && (out_col == IN_W-1);
+
+    assign debug_acc = accumulator;
+
+    initial begin
+        $readmemh(WEIGHT_FILE, weights);
+        $readmemh(BIAS_FILE, biases);
+    end
+
+    always @* begin
+        input_row_calc  = out_row + kernel_row - 1;
+        input_col_calc  = out_col + kernel_col - 1;
+        tap_valid       = 1'b0;
+        source_index_calc = 0;
+        weight_index_calc = (((out_ch_idx * IN_CH) + in_ch_idx) * 3 + kernel_row) * 3 + kernel_col;
+        dest_index_calc = (out_ch_idx * IN_H * IN_W) + (out_row * IN_W) + out_col;
+
+        if ((input_row_calc >= 0) && (input_row_calc < IN_H) &&
+            (input_col_calc >= 0) && (input_col_calc < IN_W)) begin
+            tap_valid = 1'b1;
+            source_index_calc = (in_ch_idx * IN_H * IN_W) +
+                                (input_row_calc * IN_W) + input_col_calc;
+        end
+
+        src_addr = source_index_calc;
+    end
+
+    // Synchronous weight-ROM read, aligned with the source RAM's one-cycle read.
+    always @(posedge clk) begin
+        if (rst)
+            weight_q <= 8'sd0;
+        else if ((state == ST_REQ) && tap_valid)
+            weight_q <= weights[weight_index_calc];
+    end
+
+    task advance_tap;
+    begin
+        if (kernel_col == 2) begin
+            kernel_col <= 0;
+            if (kernel_row == 2) begin
+                kernel_row <= 0;
+                if (in_ch_idx == IN_CH-1)
+                    in_ch_idx <= 0;
+                else
+                    in_ch_idx <= in_ch_idx + 1;
+            end else begin
+                kernel_row <= kernel_row + 1;
+            end
+        end else begin
+            kernel_col <= kernel_col + 1;
+        end
+    end
+    endtask
+
+    task advance_output;
+    begin
+        if (out_col == IN_W-1) begin
+            out_col <= 0;
+            if (out_row == IN_H-1) begin
+                out_row <= 0;
+                if (out_ch_idx == OUT_CH-1)
+                    out_ch_idx <= 0;
+                else
+                    out_ch_idx <= out_ch_idx + 1;
+            end else begin
+                out_row <= out_row + 1;
+            end
+        end else begin
+            out_col <= out_col + 1;
+        end
+    end
+    endtask
+
+    always @(posedge clk) begin
+        if (rst) begin
+            busy        <= 1'b0;
+            done        <= 1'b0;
+            dst_we      <= 1'b0;
+            dst_addr    <= {DST_ADDR_WIDTH{1'b0}};
+            dst_data    <= 8'd0;
+            accumulator <= 32'sd0;
+            out_ch_idx  <= 0;
+            out_row     <= 0;
+            out_col     <= 0;
+            in_ch_idx   <= 0;
+            kernel_row  <= 0;
+            kernel_col  <= 0;
+            state       <= ST_IDLE;
+        end else begin
+            done   <= 1'b0;
+            dst_we <= 1'b0;
+
+            case (state)
+                ST_IDLE: begin
+                    if (start) begin
+                        busy       <= 1'b1;
+                        out_ch_idx <= 0;
+                        out_row    <= 0;
+                        out_col    <= 0;
+                        state      <= ST_INIT;
+                    end
+                end
+
+                ST_INIT: begin
+                    accumulator <= biases[out_ch_idx];
+                    in_ch_idx   <= 0;
+                    kernel_row  <= 0;
+                    kernel_col  <= 0;
+                    state       <= ST_REQ;
+                end
+
+                ST_REQ: begin
+                    if (tap_valid) begin
+                        state <= ST_MAC;
+                    end else if (last_tap) begin
+                        state <= ST_WRITE;
+                    end else begin
+                        advance_tap;
+                    end
+                end
+
+                ST_MAC: begin
+                    accumulator <= accumulator + mac_product;
+                    if (last_tap) begin
+                        state <= ST_WRITE;
+                    end else begin
+                        advance_tap;
+                        state <= ST_REQ;
+                    end
+                end
+
+                ST_WRITE: begin
+                    dst_we   <= 1'b1;
+                    dst_addr <= dest_index_calc;
+
+                    if (accumulator <= 0)
+                        dst_data <= 8'd0;
+                    else if (shifted_acc > 32'sd255)
+                        dst_data <= 8'hFF;
+                    else
+                        dst_data <= shifted_acc[7:0];
+
+                    if (last_output) begin
+                        busy  <= 1'b0;
+                        done  <= 1'b1;
+                        state <= ST_IDLE;
+                    end else begin
+                        advance_output;
+                        state <= ST_INIT;
+                    end
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+================================================================================
+
+FILE: rtl/pool_engine.v
+EXPLANATION: Sequential 2x2 max-pooling engine.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+
+// 2x2 max-pooling, stride 2, channel-major feature-map order.
+module pool_engine #(
+    parameter IN_W           = 28,
+    parameter IN_H           = 28,
+    parameter CHANNELS       = 8,
+    parameter SRC_ADDR_WIDTH = 13,
+    parameter DST_ADDR_WIDTH = 11
+) (
+    input  wire                      clk,
+    input  wire                      rst,
+    input  wire                      start,
+    output reg                       busy,
+    output reg                       done,
+
+    output reg  [SRC_ADDR_WIDTH-1:0] src_addr,
+    input  wire [7:0]                src_data,
+
+    output reg                       dst_we,
+    output reg  [DST_ADDR_WIDTH-1:0] dst_addr,
+    output reg  [7:0]                dst_data
+);
+    localparam OUT_W = IN_W / 2;
+    localparam OUT_H = IN_H / 2;
+
+    localparam ST_IDLE    = 3'd0;
+    localparam ST_INIT    = 3'd1;
+    localparam ST_REQ     = 3'd2;
+    localparam ST_CAPTURE = 3'd3;
+    localparam ST_WRITE   = 3'd4;
+    reg [2:0] state;
+
+    integer channel_idx;
+    integer out_row;
+    integer out_col;
+    integer elem_idx;
+    integer source_row_calc;
+    integer source_col_calc;
+    integer source_index_calc;
+    integer dest_index_calc;
+
+    reg [7:0] max_value;
+    wire last_output = (channel_idx == CHANNELS-1) &&
+                       (out_row == OUT_H-1) && (out_col == OUT_W-1);
+
+    always @* begin
+        source_row_calc = (out_row * 2) + ((elem_idx >= 2) ? 1 : 0);
+        source_col_calc = (out_col * 2) + (((elem_idx == 1) || (elem_idx == 3)) ? 1 : 0);
+        source_index_calc = (channel_idx * IN_H * IN_W) +
+                            (source_row_calc * IN_W) + source_col_calc;
+        dest_index_calc = (channel_idx * OUT_H * OUT_W) +
+                          (out_row * OUT_W) + out_col;
+        src_addr = source_index_calc;
+    end
+
+    task advance_output;
+    begin
+        if (out_col == OUT_W-1) begin
+            out_col <= 0;
+            if (out_row == OUT_H-1) begin
+                out_row <= 0;
+                if (channel_idx == CHANNELS-1)
+                    channel_idx <= 0;
+                else
+                    channel_idx <= channel_idx + 1;
+            end else begin
+                out_row <= out_row + 1;
+            end
+        end else begin
+            out_col <= out_col + 1;
+        end
+    end
+    endtask
+
+    always @(posedge clk) begin
+        if (rst) begin
+            busy        <= 1'b0;
+            done        <= 1'b0;
+            dst_we      <= 1'b0;
+            dst_addr    <= {DST_ADDR_WIDTH{1'b0}};
+            dst_data    <= 8'd0;
+            channel_idx <= 0;
+            out_row     <= 0;
+            out_col     <= 0;
+            elem_idx    <= 0;
+            max_value   <= 8'd0;
+            state       <= ST_IDLE;
+        end else begin
+            done   <= 1'b0;
+            dst_we <= 1'b0;
+
+            case (state)
+                ST_IDLE: begin
+                    if (start) begin
+                        busy        <= 1'b1;
+                        channel_idx <= 0;
+                        out_row     <= 0;
+                        out_col     <= 0;
+                        state       <= ST_INIT;
+                    end
+                end
+
+                ST_INIT: begin
+                    elem_idx  <= 0;
+                    max_value <= 8'd0;
+                    state     <= ST_REQ;
+                end
+
+                ST_REQ: begin
+                    state <= ST_CAPTURE;
+                end
+
+                ST_CAPTURE: begin
+                    if (src_data > max_value)
+                        max_value <= src_data;
+
+                    if (elem_idx == 3) begin
+                        state <= ST_WRITE;
+                    end else begin
+                        elem_idx <= elem_idx + 1;
+                        state    <= ST_REQ;
+                    end
+                end
+
+                ST_WRITE: begin
+                    dst_we   <= 1'b1;
+                    dst_addr <= dest_index_calc;
+                    dst_data <= max_value;
+
+                    if (last_output) begin
+                        busy  <= 1'b0;
+                        done  <= 1'b1;
+                        state <= ST_IDLE;
+                    end else begin
+                        advance_output;
+                        state <= ST_INIT;
+                    end
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+================================================================================
+
+FILE: rtl/fc_engine.v
+EXPLANATION: Sequential 784-to-10 fully connected MAC engine.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+
+// Sequential fully connected engine.
+// score[class] = bias[class] + sum(feature[i] * weight[class][i])
+module fc_engine #(
+    parameter IN_FEATURES    = 784,
+    parameter OUT_CLASSES    = 10,
+    parameter SRC_ADDR_WIDTH = 10,
+    parameter WEIGHT_COUNT   = 7840,
+    parameter BIAS_COUNT     = 10,
+    parameter WEIGHT_FILE    = "fc_weights.hex",
+    parameter BIAS_FILE      = "fc_biases.hex"
+) (
+    input  wire                      clk,
+    input  wire                      rst,
+    input  wire                      start,
+    output reg                       busy,
+    output reg                       done,
+
+    output reg  [SRC_ADDR_WIDTH-1:0] src_addr,
+    input  wire [7:0]                src_data,
+
+    output reg                       score_we,
+    output reg  [3:0]                score_index,
+    output reg signed [31:0]         score_value,
+
+    output wire signed [31:0]        debug_acc
+);
+    reg signed [7:0]  weights [0:WEIGHT_COUNT-1];
+    reg signed [31:0] biases  [0:BIAS_COUNT-1];
+    reg signed [7:0]  weight_q;
+    reg signed [31:0] accumulator;
+
+    integer class_idx;
+    integer feature_idx;
+    integer weight_index_calc;
+
+    localparam ST_IDLE  = 3'd0;
+    localparam ST_INIT  = 3'd1;
+    localparam ST_REQ   = 3'd2;
+    localparam ST_MAC   = 3'd3;
+    localparam ST_WRITE = 3'd4;
+    reg [2:0] state;
+
+    wire signed [8:0] activation_signed = $signed({1'b0, src_data});
+    wire signed [16:0] mac_product = activation_signed * weight_q;
+
+    assign debug_acc = accumulator;
+
+    initial begin
+        $readmemh(WEIGHT_FILE, weights);
+        $readmemh(BIAS_FILE, biases);
+    end
+
+    always @* begin
+        src_addr = feature_idx;
+        weight_index_calc = (class_idx * IN_FEATURES) + feature_idx;
+    end
+
+    always @(posedge clk) begin
+        if (rst)
+            weight_q <= 8'sd0;
+        else if (state == ST_REQ)
+            weight_q <= weights[weight_index_calc];
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            busy        <= 1'b0;
+            done        <= 1'b0;
+            score_we    <= 1'b0;
+            score_index <= 4'd0;
+            score_value <= 32'sd0;
+            accumulator <= 32'sd0;
+            class_idx   <= 0;
+            feature_idx <= 0;
+            state       <= ST_IDLE;
+        end else begin
+            done     <= 1'b0;
+            score_we <= 1'b0;
+
+            case (state)
+                ST_IDLE: begin
+                    if (start) begin
+                        busy      <= 1'b1;
+                        class_idx <= 0;
+                        state     <= ST_INIT;
+                    end
+                end
+
+                ST_INIT: begin
+                    accumulator <= biases[class_idx];
+                    feature_idx <= 0;
+                    state       <= ST_REQ;
+                end
+
+                ST_REQ: begin
+                    state <= ST_MAC;
+                end
+
+                ST_MAC: begin
+                    accumulator <= accumulator + mac_product;
+                    if (feature_idx == IN_FEATURES-1) begin
+                        state <= ST_WRITE;
+                    end else begin
+                        feature_idx <= feature_idx + 1;
+                        state       <= ST_REQ;
+                    end
+                end
+
+                ST_WRITE: begin
+                    score_we    <= 1'b1;
+                    score_index <= class_idx[3:0];
+                    score_value <= accumulator;
+
+                    if (class_idx == OUT_CLASSES-1) begin
+                        busy  <= 1'b0;
+                        done  <= 1'b1;
+                        state <= ST_IDLE;
+                    end else begin
+                        class_idx <= class_idx + 1;
+                        state     <= ST_INIT;
+                    end
+                end
+
+                default: state <= ST_IDLE;
+            endcase
+        end
+    end
+endmodule
+
+================================================================================
+
+FILE: rtl/argmax.v
+EXPLANATION: Signed combinational argmax for ten class scores.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+
+// Combinational argmax over ten signed logits. Ties keep the lower index.
+module argmax10 (
+    input  wire signed [31:0] score0,
+    input  wire signed [31:0] score1,
+    input  wire signed [31:0] score2,
+    input  wire signed [31:0] score3,
+    input  wire signed [31:0] score4,
+    input  wire signed [31:0] score5,
+    input  wire signed [31:0] score6,
+    input  wire signed [31:0] score7,
+    input  wire signed [31:0] score8,
+    input  wire signed [31:0] score9,
+    output reg  [3:0]         predicted_digit
+);
+    reg signed [31:0] max_score;
+
+    always @* begin
+        max_score       = score0;
+        predicted_digit = 4'd0;
+        if (score1 > max_score) begin max_score = score1; predicted_digit = 4'd1; end
+        if (score2 > max_score) begin max_score = score2; predicted_digit = 4'd2; end
+        if (score3 > max_score) begin max_score = score3; predicted_digit = 4'd3; end
+        if (score4 > max_score) begin max_score = score4; predicted_digit = 4'd4; end
+        if (score5 > max_score) begin max_score = score5; predicted_digit = 4'd5; end
+        if (score6 > max_score) begin max_score = score6; predicted_digit = 4'd6; end
+        if (score7 > max_score) begin max_score = score7; predicted_digit = 4'd7; end
+        if (score8 > max_score) begin max_score = score8; predicted_digit = 4'd8; end
+        if (score9 > max_score) begin max_score = score9; predicted_digit = 4'd9; end
+    end
+endmodule
+
+================================================================================
+
+FILE: rtl/quant_params.vh
+EXPLANATION: Conv requantization shifts; overwritten by the training/export script.
+--------------------------------------------------------------------------------
+// This file is overwritten by python/train_export_mnist.py after calibration.
+// The defaults only let the RTL elaborate before trained artifacts are generated.
+`ifndef MNIST_CNN_QUANT_PARAMS_VH
+`define MNIST_CNN_QUANT_PARAMS_VH
+`define CONV1_SHIFT 8
+`define CONV2_SHIFT 8
+`endif
+
+================================================================================
+
+FILE: rtl/mnist_cnn_top.v
+EXPLANATION: Top-level image-loading interface, buffers, stage orchestration, scores, and prediction.
+--------------------------------------------------------------------------------
+`timescale 1ns/1ps
+`include "quant_params.vh"
+
+module mnist_cnn_top (
+    input  wire        clk,
+    input  wire        rst,
+
+    input  wire        pixel_valid,
+    input  wire [7:0]  pixel_data,
+    input  wire [9:0]  pixel_addr,
+
+    input  wire        start,
+
+    output wire        busy,
+    output reg         done,
+    output reg  [3:0]  predicted_digit,
+
+    output wire signed [31:0] score0,
+    output wire signed [31:0] score1,
+    output wire signed [31:0] score2,
+    output wire signed [31:0] score3,
+    output wire signed [31:0] score4,
+    output wire signed [31:0] score5,
+    output wire signed [31:0] score6,
+    output wire signed [31:0] score7,
+    output wire signed [31:0] score8,
+    output wire signed [31:0] score9,
+
+    output wire [3:0]  debug_state,
+    output wire signed [31:0] debug_mac_acc
+);
+    // -------------------------------
+    // Top-level orchestration states
+    // -------------------------------
+    localparam S_IDLE       = 4'd0;
+    localparam S_WAIT_C1    = 4'd1;
+    localparam S_WAIT_P1    = 4'd2;
+    localparam S_WAIT_C2    = 4'd3;
+    localparam S_WAIT_P2    = 4'd4;
+    localparam S_WAIT_FC    = 4'd5;
+    localparam S_ARGMAX     = 4'd6;
+    localparam S_DONE       = 4'd7;
+
+    reg [3:0] state;
+    reg top_busy;
+    reg [9:0] loaded_pixels;
+    reg image_ready;
+
+    assign busy        = top_busy;
+    assign debug_state = state;
+
+    // -------------------------------
+    // Score registers
+    // -------------------------------
+    reg signed [31:0] score_r0;
+    reg signed [31:0] score_r1;
+    reg signed [31:0] score_r2;
+    reg signed [31:0] score_r3;
+    reg signed [31:0] score_r4;
+    reg signed [31:0] score_r5;
+    reg signed [31:0] score_r6;
+    reg signed [31:0] score_r7;
+    reg signed [31:0] score_r8;
+    reg signed [31:0] score_r9;
+
+    assign score0 = score_r0;
+    assign score1 = score_r1;
+    assign score2 = score_r2;
+    assign score3 = score_r3;
+    assign score4 = score_r4;
+    assign score5 = score_r5;
+    assign score6 = score_r6;
+    assign score7 = score_r7;
+    assign score8 = score_r8;
+    assign score9 = score_r9;
+
+    // -------------------------------
+    // Stage start pulses
+    // -------------------------------
+    reg conv1_start;
+    reg pool1_start;
+    reg conv2_start;
+    reg pool2_start;
+    reg fc_start;
+
+    // -------------------------------
+    // Image RAM: 784 x 8
+    // -------------------------------
+    wire [9:0] conv1_src_addr;
+    wire [7:0] image_read_data;
+    wire image_we = pixel_valid && !top_busy;
+
+    sync_ram_1r1w #(
+        .DATA_WIDTH(8), .ADDR_WIDTH(10), .DEPTH(784)
+    ) u_image_mem (
+        .clk(clk),
+        .we(image_we),
+        .waddr(pixel_addr),
+        .wdata(pixel_data),
+        .raddr(conv1_src_addr),
+        .rdata(image_read_data)
+    );
+
+    // -------------------------------
+    // Conv1 memory: 28*28*8 = 6272
+    // -------------------------------
+    wire        conv1_dst_we;
+    wire [12:0] conv1_dst_addr;
+    wire [7:0]  conv1_dst_data;
+    wire [12:0] pool1_src_addr;
+    wire [7:0]  conv1_read_data;
+
+    sync_ram_1r1w #(
+        .DATA_WIDTH(8), .ADDR_WIDTH(13), .DEPTH(6272)
+    ) u_conv1_mem (
+        .clk(clk),
+        .we(conv1_dst_we),
+        .waddr(conv1_dst_addr),
+        .wdata(conv1_dst_data),
+        .raddr(pool1_src_addr),
+        .rdata(conv1_read_data)
+    );
+
+    // -------------------------------
+    // Pool1 memory: 14*14*8 = 1568
+    // -------------------------------
+    wire        pool1_dst_we;
+    wire [10:0] pool1_dst_addr;
+    wire [7:0]  pool1_dst_data;
+    wire [10:0] conv2_src_addr;
+    wire [7:0]  pool1_read_data;
+
+    sync_ram_1r1w #(
+        .DATA_WIDTH(8), .ADDR_WIDTH(11), .DEPTH(1568)
+    ) u_pool1_mem (
+        .clk(clk),
+        .we(pool1_dst_we),
+        .waddr(pool1_dst_addr),
+        .wdata(pool1_dst_data),
+        .raddr(conv2_src_addr),
+        .rdata(pool1_read_data)
+    );
+
+    // -------------------------------
+    // Conv2 memory: 14*14*16 = 3136
+    // -------------------------------
+    wire        conv2_dst_we;
+    wire [11:0] conv2_dst_addr;
+    wire [7:0]  conv2_dst_data;
+    wire [11:0] pool2_src_addr;
+    wire [7:0]  conv2_read_data;
+
+    sync_ram_1r1w #(
+        .DATA_WIDTH(8), .ADDR_WIDTH(12), .DEPTH(3136)
+    ) u_conv2_mem (
+        .clk(clk),
+        .we(conv2_dst_we),
+        .waddr(conv2_dst_addr),
+        .wdata(conv2_dst_data),
+        .raddr(pool2_src_addr),
+        .rdata(conv2_read_data)
+    );
+
+    // -------------------------------
+    // Pool2 memory: 7*7*16 = 784
+    // -------------------------------
+    wire        pool2_dst_we;
+    wire [9:0]  pool2_dst_addr;
+    wire [7:0]  pool2_dst_data;
+    wire [9:0]  fc_src_addr;
+    wire [7:0]  pool2_read_data;
+
+    sync_ram_1r1w #(
+        .DATA_WIDTH(8), .ADDR_WIDTH(10), .DEPTH(784)
+    ) u_pool2_mem (
+        .clk(clk),
+        .we(pool2_dst_we),
+        .waddr(pool2_dst_addr),
+        .wdata(pool2_dst_data),
+        .raddr(fc_src_addr),
+        .rdata(pool2_read_data)
+    );
+
+    // -------------------------------
+    // Compute engines
+    // -------------------------------
+    wire conv1_busy, conv1_done;
+    wire signed [31:0] conv1_debug_acc;
+    conv_engine #(
+        .IN_W(28), .IN_H(28), .IN_CH(1), .OUT_CH(8),
+        .OUT_SHIFT(`CONV1_SHIFT),
+        .SRC_ADDR_WIDTH(10), .DST_ADDR_WIDTH(13),
+        .WEIGHT_COUNT(72), .BIAS_COUNT(8),
+        .WEIGHT_FILE("conv1_weights.hex"),
+        .BIAS_FILE("conv1_biases.hex")
+    ) u_conv1 (
+        .clk(clk), .rst(rst), .start(conv1_start),
+        .busy(conv1_busy), .done(conv1_done),
+        .src_addr(conv1_src_addr), .src_data(image_read_data),
+        .dst_we(conv1_dst_we), .dst_addr(conv1_dst_addr), .dst_data(conv1_dst_data),
+        .debug_acc(conv1_debug_acc)
+    );
+
+    wire pool1_busy, pool1_done;
+    pool_engine #(
+        .IN_W(28), .IN_H(28), .CHANNELS(8),
+        .SRC_ADDR_WIDTH(13), .DST_ADDR_WIDTH(11)
+    ) u_pool1 (
+        .clk(clk), .rst(rst), .start(pool1_start),
+        .busy(pool1_busy), .done(pool1_done),
+        .src_addr(pool1_src_addr), .src_data(conv1_read_data),
+        .dst_we(pool1_dst_we), .dst_addr(pool1_dst_addr), .dst_data(pool1_dst_data)
+    );
+
+    wire conv2_busy, conv2_done;
+    wire signed [31:0] conv2_debug_acc;
+    conv_engine #(
+        .IN_W(14), .IN_H(14), .IN_CH(8), .OUT_CH(16),
+        .OUT_SHIFT(`CONV2_SHIFT),
+        .SRC_ADDR_WIDTH(11), .DST_ADDR_WIDTH(12),
+        .WEIGHT_COUNT(1152), .BIAS_COUNT(16),
+        .WEIGHT_FILE("conv2_weights.hex"),
+        .BIAS_FILE("conv2_biases.hex")
+    ) u_conv2 (
+        .clk(clk), .rst(rst), .start(conv2_start),
+        .busy(conv2_busy), .done(conv2_done),
+        .src_addr(conv2_src_addr), .src_data(pool1_read_data),
+        .dst_we(conv2_dst_we), .dst_addr(conv2_dst_addr), .dst_data(conv2_dst_data),
+        .debug_acc(conv2_debug_acc)
+    );
+
+    wire pool2_busy, pool2_done;
+    pool_engine #(
+        .IN_W(14), .IN_H(14), .CHANNELS(16),
+        .SRC_ADDR_WIDTH(12), .DST_ADDR_WIDTH(10)
+    ) u_pool2 (
+        .clk(clk), .rst(rst), .start(pool2_start),
+        .busy(pool2_busy), .done(pool2_done),
+        .src_addr(pool2_src_addr), .src_data(conv2_read_data),
+        .dst_we(pool2_dst_we), .dst_addr(pool2_dst_addr), .dst_data(pool2_dst_data)
+    );
+
+    wire fc_busy, fc_done;
+    wire fc_score_we;
+    wire [3:0] fc_score_index;
+    wire signed [31:0] fc_score_value;
+    wire signed [31:0] fc_debug_acc;
+    fc_engine #(
+        .IN_FEATURES(784), .OUT_CLASSES(10),
+        .SRC_ADDR_WIDTH(10), .WEIGHT_COUNT(7840), .BIAS_COUNT(10),
+        .WEIGHT_FILE("fc_weights.hex"),
+        .BIAS_FILE("fc_biases.hex")
+    ) u_fc (
+        .clk(clk), .rst(rst), .start(fc_start),
+        .busy(fc_busy), .done(fc_done),
+        .src_addr(fc_src_addr), .src_data(pool2_read_data),
+        .score_we(fc_score_we), .score_index(fc_score_index), .score_value(fc_score_value),
+        .debug_acc(fc_debug_acc)
+    );
+
+    wire [3:0] argmax_digit;
+    argmax10 u_argmax (
+        .score0(score_r0), .score1(score_r1), .score2(score_r2), .score3(score_r3), .score4(score_r4),
+        .score5(score_r5), .score6(score_r6), .score7(score_r7), .score8(score_r8), .score9(score_r9),
+        .predicted_digit(argmax_digit)
+    );
+
+    assign debug_mac_acc = (state == S_WAIT_C1) ? conv1_debug_acc :
+                           (state == S_WAIT_C2) ? conv2_debug_acc :
+                           (state == S_WAIT_FC) ? fc_debug_acc    : 32'sd0;
+
+    // Capture FC scores whenever they are produced.
+    always @(posedge clk) begin
+        if (rst) begin
+            score_r0 <= 32'sd0; score_r1 <= 32'sd0; score_r2 <= 32'sd0; score_r3 <= 32'sd0; score_r4 <= 32'sd0;
+            score_r5 <= 32'sd0; score_r6 <= 32'sd0; score_r7 <= 32'sd0; score_r8 <= 32'sd0; score_r9 <= 32'sd0;
+        end else if (fc_score_we) begin
+            case (fc_score_index)
+                4'd0: score_r0 <= fc_score_value;
+                4'd1: score_r1 <= fc_score_value;
+                4'd2: score_r2 <= fc_score_value;
+                4'd3: score_r3 <= fc_score_value;
+                4'd4: score_r4 <= fc_score_value;
+                4'd5: score_r5 <= fc_score_value;
+                4'd6: score_r6 <= fc_score_value;
+                4'd7: score_r7 <= fc_score_value;
+                4'd8: score_r8 <= fc_score_value;
+                4'd9: score_r9 <= fc_score_value;
+                default: ;
+            endcase
+        end
+    end
+
+    // External loading and stage controller.
+    always @(posedge clk) begin
+        if (rst) begin
+            state           <= S_IDLE;
+            top_busy        <= 1'b0;
+            done            <= 1'b0;
+            predicted_digit <= 4'd0;
+            loaded_pixels   <= 10'd0;
+            image_ready     <= 1'b0;
+            conv1_start     <= 1'b0;
+            pool1_start     <= 1'b0;
+            conv2_start     <= 1'b0;
+            pool2_start     <= 1'b0;
+            fc_start        <= 1'b0;
+        end else begin
+            done        <= 1'b0;
+            conv1_start <= 1'b0;
+            pool1_start <= 1'b0;
+            conv2_start <= 1'b0;
+            pool2_start <= 1'b0;
+            fc_start    <= 1'b0;
+
+            // Host writes are accepted only while idle. The expected Cocotb
+            // protocol sends 784 writes, one per address 0..783.
+            if (pixel_valid && !top_busy) begin
+                if (loaded_pixels < 10'd784)
+                    loaded_pixels <= loaded_pixels + 1'b1;
+                if (loaded_pixels == 10'd783)
+                    image_ready <= 1'b1;
+            end
+
+            case (state)
+                S_IDLE: begin
+                    top_busy <= 1'b0;
+                    if (start && image_ready && !pixel_valid) begin
+                        top_busy      <= 1'b1;
+                        loaded_pixels <= 10'd0;
+                        image_ready   <= 1'b0;
+                        conv1_start   <= 1'b1;
+                        state         <= S_WAIT_C1;
+                    end
+                end
+
+                S_WAIT_C1: begin
+                    top_busy <= 1'b1;
+                    if (conv1_done) begin
+                        pool1_start <= 1'b1;
+                        state       <= S_WAIT_P1;
+                    end
+                end
+
+                S_WAIT_P1: begin
+                    top_busy <= 1'b1;
+                    if (pool1_done) begin
+                        conv2_start <= 1'b1;
+                        state       <= S_WAIT_C2;
+                    end
+                end
+
+                S_WAIT_C2: begin
+                    top_busy <= 1'b1;
+                    if (conv2_done) begin
+                        pool2_start <= 1'b1;
+                        state       <= S_WAIT_P2;
+                    end
+                end
+
+                S_WAIT_P2: begin
+                    top_busy <= 1'b1;
+                    if (pool2_done) begin
+                        fc_start <= 1'b1;
+                        state    <= S_WAIT_FC;
+                    end
+                end
+
+                S_WAIT_FC: begin
+                    top_busy <= 1'b1;
+                    if (fc_done)
+                        state <= S_ARGMAX;
+                end
+
+                S_ARGMAX: begin
+                    top_busy        <= 1'b1;
+                    predicted_digit <= argmax_digit;
+                    state           <= S_DONE;
+                end
+
+                S_DONE: begin
+                    top_busy <= 1'b0;
+                    done     <= 1'b1;
+                    state    <= S_IDLE;
+                end
+
+                default: begin
+                    top_busy <= 1'b0;
+                    state    <= S_IDLE;
+                end
+            endcase
+        end
+    end
+endmodule
+
+================================================================================
+
+FILE: python/train_export_mnist.py
+EXPLANATION: Trains the exact CNN on MNIST, quantizes it, exports HEX parameters and real test images.
+--------------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""Train the exact FPGA-friendly MNIST CNN and export integer RTL artifacts.
+
+The exported fixed-point rule is:
+  accumulator = bias_q + sum(activation_q * weight_q)
+  activation_out = saturate_uint8(max(accumulator, 0) >> SHIFT)
+
+Weights are INT8. Biases and accumulators are INT32. Pooling is exact UINT8 max.
+The FC layer keeps signed INT32 logits and the hardware performs argmax only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+ROOT = Path(__file__).resolve().parents[1]
+WEIGHTS_DIR = ROOT / "weights"
+IMAGES_DIR = ROOT / "test_images"
+RTL_DIR = ROOT / "rtl"
+DATA_DIR = ROOT / "data"
+
+
+class MNISTNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 8, 3, stride=1, padding=1, bias=True)
+        self.conv2 = nn.Conv2d(8, 16, 3, stride=1, padding=1, bias=True)
+        self.fc = nn.Linear(16 * 7 * 7, 10, bias=True)
+
+    def forward(self, x):
+        x = F.max_pool2d(F.relu(self.conv1(x)), 2)
+        x = F.max_pool2d(F.relu(self.conv2(x)), 2)
+        x = torch.flatten(x, 1)  # NCHW -> channel-major CHW order per sample
+        return self.fc(x)
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def signed_hex(x: int, bits: int) -> str:
+    mask = (1 << bits) - 1
+    return f"{x & mask:0{bits // 4}X}"
+
+
+def export_hex(path: Path, values: np.ndarray, bits: int):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flat = np.asarray(values).reshape(-1)
+    with path.open("w") as f:
+        for x in flat:
+            f.write(signed_hex(int(x), bits) + "\n")
+
+
+def quantize_weight(w: torch.Tensor):
+    max_abs = float(w.detach().abs().max().cpu())
+    if max_abs == 0.0:
+        scale = 1.0
+    else:
+        scale = max_abs / 127.0
+    q = torch.round(w.detach().cpu() / scale).clamp(-127, 127).to(torch.int64)
+    return q, scale
+
+
+def quantize_bias(b: torch.Tensor, input_scale: float, weight_scale: float):
+    scale = input_scale * weight_scale
+    q = torch.round(b.detach().cpu() / scale).clamp(-(2**31), 2**31 - 1).to(torch.int64)
+    return q
+
+
+def choose_shift(relu_acc: torch.Tensor, percentile: float = 0.999):
+    vals = relu_acc.detach().reshape(-1)
+    if vals.numel() > 500_000:
+        # Deterministic evenly-spaced sample keeps calibration fast and repeatable.
+        idx = torch.linspace(0, vals.numel() - 1, steps=500_000).long()
+        vals = vals[idx]
+    target = float(torch.quantile(vals.double(), percentile).item())
+    if target <= 255.0:
+        return 0
+    return max(0, int(math.ceil(math.log2(target / 255.0))))
+
+
+def requant_relu(acc: torch.Tensor, shift: int):
+    # acc is float64 but contains integer-valued sums exactly in this range.
+    q = torch.floor(torch.clamp(acc, min=0.0) / float(1 << shift))
+    return torch.clamp(q, 0, 255)
+
+
+def qconv(xq, wq, bq, shift):
+    acc = F.conv2d(xq.double(), wq.double(), bq.double(), stride=1, padding=1)
+    return requant_relu(acc, shift), acc
+
+
+def build_quantized_artifacts(model: MNISTNet, calib_images_u8: torch.Tensor):
+    input_scale = 1.0 / 255.0
+
+    c1w_q, c1w_scale = quantize_weight(model.conv1.weight)
+    c1b_q = quantize_bias(model.conv1.bias, input_scale, c1w_scale)
+    _, c1_acc = qconv(calib_images_u8, c1w_q, c1b_q, 0)
+    c1_shift = choose_shift(torch.clamp(c1_acc, min=0.0))
+    c1_q = requant_relu(c1_acc, c1_shift)
+    p1_q = F.max_pool2d(c1_q, 2)
+    c1_out_scale = input_scale * c1w_scale * (1 << c1_shift)
+
+    c2w_q, c2w_scale = quantize_weight(model.conv2.weight)
+    c2b_q = quantize_bias(model.conv2.bias, c1_out_scale, c2w_scale)
+    _, c2_acc = qconv(p1_q, c2w_q, c2b_q, 0)
+    c2_shift = choose_shift(torch.clamp(c2_acc, min=0.0))
+    c2_q = requant_relu(c2_acc, c2_shift)
+    p2_q = F.max_pool2d(c2_q, 2)
+    c2_out_scale = c1_out_scale * c2w_scale * (1 << c2_shift)
+
+    fcw_q, fcw_scale = quantize_weight(model.fc.weight)
+    fcb_q = quantize_bias(model.fc.bias, c2_out_scale, fcw_scale)
+
+    return {
+        "conv1_weights": c1w_q,
+        "conv1_biases": c1b_q,
+        "conv2_weights": c2w_q,
+        "conv2_biases": c2b_q,
+        "fc_weights": fcw_q,
+        "fc_biases": fcb_q,
+        "conv1_shift": c1_shift,
+        "conv2_shift": c2_shift,
+        "input_scale": input_scale,
+        "conv1_weight_scale": c1w_scale,
+        "conv1_output_scale": c1_out_scale,
+        "conv2_weight_scale": c2w_scale,
+        "conv2_output_scale": c2_out_scale,
+        "fc_weight_scale": fcw_scale,
+    }
+
+
+def quantized_forward(images_u8: torch.Tensor, q):
+    c1_q, _ = qconv(images_u8, q["conv1_weights"], q["conv1_biases"], q["conv1_shift"])
+    p1_q = F.max_pool2d(c1_q, 2)
+    c2_q, _ = qconv(p1_q, q["conv2_weights"], q["conv2_biases"], q["conv2_shift"])
+    p2_q = F.max_pool2d(c2_q, 2)
+    flat = p2_q.reshape(p2_q.shape[0], -1).double()
+    logits = flat @ q["fc_weights"].double().t() + q["fc_biases"].double()
+    return logits, (c1_q, p1_q, c2_q, p2_q)
+
+
+def evaluate_float(model, loader, device):
+    model.eval()
+    correct = total = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x).argmax(1)
+            correct += int((pred == y).sum())
+            total += y.numel()
+    return correct / total
+
+
+def evaluate_quantized(test_ds, q, max_samples: int, batch_size: int = 128):
+    total = min(len(test_ds), max_samples if max_samples > 0 else len(test_ds))
+    correct = 0
+    for start in range(0, total, batch_size):
+        stop = min(total, start + batch_size)
+        imgs = test_ds.data[start:stop].unsqueeze(1).double()
+        labels = test_ds.targets[start:stop]
+        logits, _ = quantized_forward(imgs, q)
+        correct += int((logits.argmax(1).cpu() == labels).sum())
+    return correct / total
+
+
+def export_test_images(test_ds, q):
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    found = {}
+    batch = 128
+    for start in range(0, len(test_ds), batch):
+        stop = min(len(test_ds), start + batch)
+        imgs = test_ds.data[start:stop].unsqueeze(1).double()
+        labels = test_ds.targets[start:stop]
+        logits, _ = quantized_forward(imgs, q)
+        preds = logits.argmax(1).cpu()
+        for i in range(stop - start):
+            label = int(labels[i])
+            if label not in found and int(preds[i]) == label:
+                found[label] = start + i
+        if len(found) == 10:
+            break
+
+    if len(found) != 10:
+        raise RuntimeError(f"Could not find one correctly quantized test sample for each digit; found {sorted(found)}")
+
+    lines = []
+    for digit in range(10):
+        idx = found[digit]
+        img = test_ds.data[idx].numpy().reshape(-1)
+        path = IMAGES_DIR / f"digit_{digit}.hex"
+        with path.open("w") as f:
+            for px in img:
+                f.write(f"{int(px):02X}\n")
+        lines.append(f"digit_{digit}.hex {digit} dataset_index={idx}\n")
+    (IMAGES_DIR / "labels.txt").write_text("".join(lines))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--epochs", type=int, default=3)
+    ap.add_argument("--batch-size", type=int, default=128)
+    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--calibration-samples", type=int, default=1024)
+    ap.add_argument("--quant-eval-samples", type=int, default=10000, help="0 means all test samples")
+    ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    args = ap.parse_args()
+
+    seed_everything(args.seed)
+    WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+
+    tfm = transforms.ToTensor()
+    train_ds = datasets.MNIST(DATA_DIR, train=True, download=True, transform=tfm)
+    test_ds = datasets.MNIST(DATA_DIR, train=False, download=True, transform=tfm)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=0)
+
+    device = torch.device(args.device)
+    model = MNISTNet().to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    print(f"Training on {device} ...")
+    for epoch in range(args.epochs):
+        model.train()
+        running = 0.0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(x)
+            loss = loss_fn(logits, y)
+            loss.backward()
+            opt.step()
+            running += float(loss.item()) * y.numel()
+        acc = evaluate_float(model, test_loader, device)
+        print(f"epoch {epoch+1}/{args.epochs}: loss={running/len(train_ds):.5f} test_acc={acc*100:.2f}%")
+
+    # Calibration images use exact original 0..255 integers, not normalized floats.
+    ncal = min(args.calibration_samples, len(train_ds))
+    calib = train_ds.data[:ncal].unsqueeze(1).double()
+    q = build_quantized_artifacts(model.cpu(), calib)
+
+    export_hex(WEIGHTS_DIR / "conv1_weights.hex", q["conv1_weights"].numpy(), 8)
+    export_hex(WEIGHTS_DIR / "conv1_biases.hex", q["conv1_biases"].numpy(), 32)
+    export_hex(WEIGHTS_DIR / "conv2_weights.hex", q["conv2_weights"].numpy(), 8)
+    export_hex(WEIGHTS_DIR / "conv2_biases.hex", q["conv2_biases"].numpy(), 32)
+    export_hex(WEIGHTS_DIR / "fc_weights.hex", q["fc_weights"].numpy(), 8)
+    export_hex(WEIGHTS_DIR / "fc_biases.hex", q["fc_biases"].numpy(), 32)
+
+    meta = {
+        "conv1_shift": int(q["conv1_shift"]),
+        "conv2_shift": int(q["conv2_shift"]),
+        "input_scale": float(q["input_scale"]),
+        "conv1_weight_scale": float(q["conv1_weight_scale"]),
+        "conv1_output_scale": float(q["conv1_output_scale"]),
+        "conv2_weight_scale": float(q["conv2_weight_scale"]),
+        "conv2_output_scale": float(q["conv2_output_scale"]),
+        "fc_weight_scale": float(q["fc_weight_scale"]),
+        "weight_order": "out_channel,input_channel,kernel_row,kernel_col; FC=out_neuron,input_feature",
+        "feature_order": "channel,row,column (CHW)",
+    }
+    (WEIGHTS_DIR / "quantization.json").write_text(json.dumps(meta, indent=2) + "\n")
+    (RTL_DIR / "quant_params.vh").write_text(
+        "// Auto-generated by python/train_export_mnist.py\n"
+        "`ifndef MNIST_CNN_QUANT_PARAMS_VH\n"
+        "`define MNIST_CNN_QUANT_PARAMS_VH\n"
+        f"`define CONV1_SHIFT {q['conv1_shift']}\n"
+        f"`define CONV2_SHIFT {q['conv2_shift']}\n"
+        "`endif\n"
+    )
+
+    qacc = evaluate_quantized(test_ds, q, args.quant_eval_samples)
+    print(f"Quantized integer accuracy: {qacc*100:.2f}%")
+    print(f"Conv1 shift={q['conv1_shift']}  Conv2 shift={q['conv2_shift']}")
+
+    export_test_images(test_ds, q)
+    torch.save(model.state_dict(), WEIGHTS_DIR / "float_model_state.pt")
+    print("Exported trained weights, biases, quantization metadata, RTL shift include, and 10 real MNIST test images.")
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+FILE: python/verify_quantized_model.py
+EXPLANATION: Integer golden model matching RTL indexing, signed arithmetic, shifts, pooling, FC, and argmax.
+--------------------------------------------------------------------------------
+#!/usr/bin/env python3
+"""Bit-accurate integer reference model for the RTL data path."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+WEIGHTS = ROOT / "weights"
+IMAGES = ROOT / "test_images"
+
+
+def read_signed_hex(path: Path, bits: int) -> np.ndarray:
+    mask = (1 << bits) - 1
+    sign = 1 << (bits - 1)
+    vals = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        x = int(line, 16) & mask
+        if x & sign:
+            x -= 1 << bits
+        vals.append(x)
+    return np.asarray(vals, dtype=np.int64)
+
+
+def read_image(path: Path) -> np.ndarray:
+    vals = [int(x.strip(), 16) for x in path.read_text().splitlines() if x.strip()]
+    if len(vals) != 784:
+        raise ValueError(f"{path}: expected 784 pixels, got {len(vals)}")
+    return np.asarray(vals, dtype=np.int64).reshape(28, 28)
+
+
+def conv_relu_shift(x: np.ndarray, w: np.ndarray, b: np.ndarray, shift: int) -> np.ndarray:
+    # x: [C,H,W], w: [O,C,3,3], b: [O]
+    c, h, wid = x.shape
+    out_ch = w.shape[0]
+    out = np.zeros((out_ch, h, wid), dtype=np.int64)
+    for oc in range(out_ch):
+        for r in range(h):
+            for col in range(wid):
+                acc = int(b[oc])
+                for ic in range(c):
+                    for kr in range(3):
+                        rr = r + kr - 1
+                        if rr < 0 or rr >= h:
+                            continue
+                        for kc in range(3):
+                            cc = col + kc - 1
+                            if cc < 0 or cc >= wid:
+                                continue
+                            acc += int(x[ic, rr, cc]) * int(w[oc, ic, kr, kc])
+                if acc <= 0:
+                    q = 0
+                else:
+                    q = acc >> shift
+                    if q > 255:
+                        q = 255
+                out[oc, r, col] = q
+    return out
+
+
+def maxpool2(x: np.ndarray) -> np.ndarray:
+    c, h, w = x.shape
+    out = np.zeros((c, h // 2, w // 2), dtype=np.int64)
+    for ch in range(c):
+        for r in range(h // 2):
+            for col in range(w // 2):
+                out[ch, r, col] = np.max(x[ch, r*2:r*2+2, col*2:col*2+2])
+    return out
+
+
+def infer(image: np.ndarray, params: dict, debug: bool = False):
+    c1w = read_signed_hex(WEIGHTS / "conv1_weights.hex", 8).reshape(8, 1, 3, 3)
+    c1b = read_signed_hex(WEIGHTS / "conv1_biases.hex", 32)
+    c2w = read_signed_hex(WEIGHTS / "conv2_weights.hex", 8).reshape(16, 8, 3, 3)
+    c2b = read_signed_hex(WEIGHTS / "conv2_biases.hex", 32)
+    fcw = read_signed_hex(WEIGHTS / "fc_weights.hex", 8).reshape(10, 784)
+    fcb = read_signed_hex(WEIGHTS / "fc_biases.hex", 32)
+
+    x = image.reshape(1, 28, 28)
+    conv1 = conv_relu_shift(x, c1w, c1b, int(params["conv1_shift"]))
+    pool1 = maxpool2(conv1)
+    conv2 = conv_relu_shift(pool1, c2w, c2b, int(params["conv2_shift"]))
+    pool2 = maxpool2(conv2)
+    flat = pool2.reshape(-1)  # CHW order, exactly like PyTorch NCHW flatten and RTL
+
+    scores = np.empty(10, dtype=np.int64)
+    for j in range(10):
+        scores[j] = int(fcb[j]) + int(np.dot(flat, fcw[j]))
+    pred = int(np.argmax(scores))
+
+    if debug:
+        print("Conv1 first 10:", conv1.reshape(-1)[:10].tolist())
+        print("Pool1 first 10:", pool1.reshape(-1)[:10].tolist())
+        print("Conv2 first 10:", conv2.reshape(-1)[:10].tolist())
+        print("Pool2 first 10:", pool2.reshape(-1)[:10].tolist())
+        print("Scores:", scores.tolist())
+        print("Prediction:", pred)
+    return pred, scores, (conv1, pool1, conv2, pool2)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--image", type=Path, help="One 784-line HEX image to verify")
+    ap.add_argument("--all", action="store_true", help="Verify digit_0.hex ... digit_9.hex")
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    params_path = WEIGHTS / "quantization.json"
+    if not params_path.exists():
+        raise SystemExit("Missing trained artifacts. Run: python python/train_export_mnist.py")
+    params = json.loads(params_path.read_text())
+
+    if args.image:
+        pred, scores, _ = infer(read_image(args.image), params, args.debug)
+        print(f"{args.image.name}: predicted {pred}")
+        print("scores:", " ".join(str(int(x)) for x in scores))
+        return
+
+    paths = [IMAGES / f"digit_{d}.hex" for d in range(10)] if args.all or not args.image else [args.image]
+    passed = 0
+    for expected, path in enumerate(paths):
+        pred, scores, _ = infer(read_image(path), params, args.debug)
+        ok = pred == expected
+        print(f"Digit {expected}: predicted={pred} {'PASS' if ok else 'FAIL'}")
+        if ok:
+            passed += 1
+    print(f"Passed: {passed}/{len(paths)}")
+    if passed != len(paths):
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
+
+================================================================================
+
+FILE: simulation/test_mnist_cnn.py
+EXPLANATION: Cocotb testbench that loads multiple images through the top-level interface and checks outputs.
+--------------------------------------------------------------------------------
+import os
+from pathlib import Path
+import cocotb
+from cocotb.clock import Clock
+from cocotb.triggers import RisingEdge
+
+ROOT = Path(__file__).resolve().parents[1]
+IMAGE_DIR = ROOT / "test_images"
+
+
+def to_signed32(raw: int) -> int:
+    raw &= 0xFFFFFFFF
+    return raw - (1 << 32) if raw & 0x80000000 else raw
+
+
+def load_hex_image(path: Path):
+    pixels = [int(line.strip(), 16) for line in path.read_text().splitlines() if line.strip()]
+    if len(pixels) != 784:
+        raise ValueError(f"{path}: expected 784 pixels, got {len(pixels)}")
+    return pixels
+
+
+async def reset_dut(dut):
+    dut.rst.value = 1
+    dut.pixel_valid.value = 0
+    dut.pixel_addr.value = 0
+    dut.pixel_data.value = 0
+    dut.start.value = 0
+    for _ in range(5):
+        await RisingEdge(dut.clk)
+    dut.rst.value = 0
+    await RisingEdge(dut.clk)
+
+
+async def load_image(dut, image):
+    while int(dut.busy.value):
+        await RisingEdge(dut.clk)
+    for addr, pixel in enumerate(image):
+        dut.pixel_addr.value = addr
+        dut.pixel_data.value = pixel
+        dut.pixel_valid.value = 1
+        await RisingEdge(dut.clk)
+    dut.pixel_valid.value = 0
+    await RisingEdge(dut.clk)
+
+
+async def run_inference(dut, timeout_cycles=900_000):
+    dut.start.value = 1
+    await RisingEdge(dut.clk)
+    dut.start.value = 0
+
+    saw_busy = False
+    for _ in range(timeout_cycles):
+        await RisingEdge(dut.clk)
+        if int(dut.busy.value):
+            saw_busy = True
+        if int(dut.done.value):
+            break
+    else:
+        raise TimeoutError("CNN inference timeout")
+
+    assert saw_busy, "busy never asserted"
+    prediction = int(dut.predicted_digit.value)
+    scores = [to_signed32(int(getattr(dut, f"score{i}").value)) for i in range(10)]
+    return prediction, scores
+
+
+def try_dump_intermediates(dut):
+    if os.getenv("DUMP_INTERMEDIATES", "0") != "1":
+        return
+    for name in ["u_conv1_mem", "u_pool1_mem", "u_conv2_mem", "u_pool2_mem"]:
+        try:
+            mem = getattr(getattr(dut, name), "mem")
+            vals = [int(mem[i].value) for i in range(10)]
+            dut._log.info("%s first 10: %s", name, vals)
+        except Exception as exc:
+            dut._log.info("%s memory not exposed by this simulator (%s)", name, exc)
+
+
+@cocotb.test()
+async def test_ten_mnist_digits(dut):
+    cocotb.start_soon(Clock(dut.clk, 10, units="ns").start())
+    await reset_dut(dut)
+
+    passed = 0
+    for expected in range(10):
+        path = IMAGE_DIR / f"digit_{expected}.hex"
+        assert path.exists(), f"Missing {path}. Run ../python/train_export_mnist.py first."
+        image = load_hex_image(path)
+        await load_image(dut, image)
+        prediction, scores = await run_inference(dut)
+
+        dut._log.info("================================================")
+        dut._log.info("Image           : %s", path.name)
+        dut._log.info("Expected digit  : %d", expected)
+        dut._log.info("Predicted digit : %d", prediction)
+        for i, s in enumerate(scores):
+            dut._log.info("Score[%d] = %d", i, s)
+
+        if prediction == expected:
+            passed += 1
+            dut._log.info("RESULT: PASS")
+        else:
+            dut._log.error("RESULT: FAIL")
+        dut._log.info("================================================")
+        try_dump_intermediates(dut)
+
+        # done must be a one-cycle pulse.
+        await RisingEdge(dut.clk)
+        assert int(dut.done.value) == 0, "done should pulse for one clock only"
+
+    dut._log.info("Passed: %d", passed)
+    dut._log.info("Failed: %d", 10 - passed)
+    assert passed == 10
+
+================================================================================
+
+FILE: simulation/Makefile
+EXPLANATION: Cocotb build/run file for Icarus or Verilator, including weight-file links and helper targets.
+--------------------------------------------------------------------------------
+.DEFAULT_GOAL := sim
+
+TOPLEVEL_LANG = verilog
+SIM ?= icarus
+
+VERILOG_SOURCES = \
+	$(PWD)/../rtl/sync_ram_1r1w.v \
+	$(PWD)/../rtl/conv_engine.v \
+	$(PWD)/../rtl/pool_engine.v \
+	$(PWD)/../rtl/fc_engine.v \
+	$(PWD)/../rtl/argmax.v \
+	$(PWD)/../rtl/mnist_cnn_top.v
+
+TOPLEVEL = mnist_cnn_top
+MODULE = test_mnist_cnn
+
+COMPILE_ARGS += -I$(PWD)/../rtl
+
+# Cocotb simulator makefiles provide WAVES=1 support where the simulator supports it.
+# Depending on cocotb/simulator version, the generated waveform may be dump.vcd or dump.fst.
+
+.PHONY: check_artifacts link_artifacts train verify clean_links
+
+check_artifacts:
+	@test -f ../weights/conv1_weights.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../weights/conv1_biases.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../weights/conv2_weights.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../weights/conv2_biases.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../weights/fc_weights.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../weights/fc_biases.hex || (echo "Missing trained weights. Run: make train"; exit 1)
+	@test -f ../test_images/digit_0.hex || (echo "Missing test images. Run: make train"; exit 1)
+
+link_artifacts: check_artifacts
+	@ln -sf ../weights/conv1_weights.hex conv1_weights.hex
+	@ln -sf ../weights/conv1_biases.hex conv1_biases.hex
+	@ln -sf ../weights/conv2_weights.hex conv2_weights.hex
+	@ln -sf ../weights/conv2_biases.hex conv2_biases.hex
+	@ln -sf ../weights/fc_weights.hex fc_weights.hex
+	@ln -sf ../weights/fc_biases.hex fc_biases.hex
+
+train:
+	cd .. && python3 python/train_export_mnist.py
+
+verify: check_artifacts
+	cd .. && python3 python/verify_quantized_model.py --all --debug
+
+clean_links:
+	rm -f conv1_weights.hex conv1_biases.hex conv2_weights.hex conv2_biases.hex fc_weights.hex fc_biases.hex
+
+sim: link_artifacts
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
+
+================================================================================
+
+FILE: simulation/requirements.txt
+EXPLANATION: Python dependencies.
+--------------------------------------------------------------------------------
+cocotb>=1.8
+numpy>=1.24
+torch>=2.0
+torchvision>=0.15
+
+================================================================================
+
+FILE: requirements.txt
+EXPLANATION: Convenience copy of the Python dependencies at project root.
+--------------------------------------------------------------------------------
+cocotb>=1.8
+numpy>=1.24
+torch>=2.0
+torchvision>=0.15
+
+================================================================================
+
+FILE: weights/README.md
+EXPLANATION: Explains generated trained weight and bias files.
+--------------------------------------------------------------------------------
+# Generated trained model artifacts
+
+Run:
+
+```bash
+python3 python/train_export_mnist.py
+```
+
+The script creates the six required trained parameter HEX files:
+
+- `conv1_weights.hex` — 72 signed INT8 values
+- `conv1_biases.hex` — 8 signed INT32 values
+- `conv2_weights.hex` — 1152 signed INT8 values
+- `conv2_biases.hex` — 16 signed INT32 values
+- `fc_weights.hex` — 7840 signed INT8 values
+- `fc_biases.hex` — 10 signed INT32 values
+
+It also creates `quantization.json` and saves the float model state for reproducibility.
+
+This repository intentionally does not substitute random or fabricated weights. The exporter trains MNIST and writes the real trained values.
+
+================================================================================
+
+FILE: test_images/README.md
+EXPLANATION: Explains generated real MNIST per-digit HEX images.
+--------------------------------------------------------------------------------
+# Generated MNIST verification images
+
+Run `python3 python/train_export_mnist.py`.
+
+The script selects one real MNIST test-set image per class that the exported quantized model classifies correctly and creates:
+
+`digit_0.hex` through `digit_9.hex`.
+
+Each file contains exactly 784 lines, one 8-bit hexadecimal pixel per line, in row-major image order (`address = row*28 + column`).
+
+================================================================================
+
+FILE: README.md
+EXPLANATION: Architecture, memory layout, quantization, simulation, waveform, and Vivado instructions.
+--------------------------------------------------------------------------------
+# MNIST CNN FPGA — Verilog-2001 + Cocotb
+
+This project implements a small handwritten-digit CNN accelerator whose **input image is loaded externally at run time**. CNN model parameters are initialized from trained HEX files, but the 28×28 test image is never hard-coded into the synthesizable top module.
+
+## 1. Architecture
+
+```text
+External 28x28 UINT8 image
+        |
+        | pixel_addr / pixel_data / pixel_valid
+        v
+Image RAM (784 x 8)
+        |
+        v
+Conv1 3x3, 1->8, pad=1
+        |
+      ReLU + fixed-point shift + UINT8 saturation
+        |
+MaxPool 2x2
+        |
+Conv2 3x3, 8->16, pad=1
+        |
+      ReLU + fixed-point shift + UINT8 saturation
+        |
+MaxPool 2x2
+        |
+7x7x16 = 784 features (CHW order)
+        |
+Fully connected 784->10
+        |
+10 signed INT32 logits
+        |
+Argmax (no Softmax)
+        v
+Predicted digit 0..9
+```
+
+Shape check:
+
+```text
+28x28x1 -> 28x28x8 -> 14x14x8 -> 14x14x16 -> 7x7x16 -> 784 -> 10
+```
+
+## 2. Why this implementation is FPGA-friendly
+
+The convolution and fully connected engines are **sequential**. They reuse a single multiply operation instead of instantiating every multiplication in parallel. This favors low resource usage and easy verification over maximum throughput.
+
+More parallel MACs can be added later for speed, at the cost of DSPs, BRAM bandwidth, routing, and controller complexity.
+
+All arithmetic in RTL is integer/fixed point. There is no `real`, floating point, delay statement, or software-only arithmetic in the data path.
+
+## 3. Top-level image interface
+
+```verilog
+pixel_valid
+pixel_data[7:0]
+pixel_addr[9:0]
+start
+busy
+done
+predicted_digit[3:0]
+score0 ... score9
+```
+
+A host writes one pixel per clock while `busy=0`:
+
+```text
+address = row*28 + column
+0 .. 783
+```
+
+After 784 write cycles, pulse `start` for one clock. The controller does not accept a start until 784 pixel writes have been observed. Host writes are ignored while the accelerator is busy.
+
+`done` is a **one-clock pulse**. Scores and `predicted_digit` remain valid afterward until the next inference overwrites them.
+
+Multiple images can be classified without reset or resynthesis:
+
+```text
+load 784 pixels -> start -> wait done -> read result
+load next 784 pixels -> start -> wait done -> read result
+...
+```
+
+## 4. Memory layouts
+
+All intermediate feature maps use channel-major CHW order:
+
+```text
+address = channel*(HEIGHT*WIDTH) + row*WIDTH + column
+```
+
+Therefore Pool2 flatten is exactly:
+
+```text
+feature_index = channel*49 + row*7 + column
+```
+
+This matches PyTorch NCHW flattening.
+
+Buffer sizes:
+
+| Buffer | Shape | Values | Address width |
+|---|---:|---:|---:|
+| Image | 28x28x1 | 784 | 10 |
+| Conv1 | 28x28x8 | 6272 | 13 |
+| Pool1 | 14x14x8 | 1568 | 11 |
+| Conv2 | 14x14x16 | 3136 | 12 |
+| Pool2 | 7x7x16 | 784 | 10 |
+
+The RAM module has a synchronous one-cycle read. This style is intentionally compatible with FPGA block/distributed RAM inference, subject to normal Vivado inference decisions.
+
+## 5. Weight organization and parameter counts
+
+| Layer | Weight shape | Weight count | Bias count |
+|---|---:|---:|---:|
+| Conv1 | 8x1x3x3 | 72 | 8 |
+| Conv2 | 16x8x3x3 | 1152 | 16 |
+| FC | 10x784 | 7840 | 10 |
+
+Conv weights are linearized in this order:
+
+```text
+for output_channel
+  for input_channel
+    for kernel_row
+      for kernel_column
+```
+
+For Conv2:
+
+```text
+weight_address = (((out_ch*8)+in_ch)*3+kernel_row)*3+kernel_col
+```
+
+FC order:
+
+```text
+weight_address = output_neuron*784 + input_feature
+```
+
+PyTorch tensors are flattened in those exact native row-major orders by the exporter.
+
+## 6. Quantization
+
+Input pixels are exact UINT8 MNIST values 0..255. Weights are symmetric signed INT8. Biases are signed INT32 in accumulator units.
+
+For a convolution:
+
+```text
+acc = bias_q + sum(UINT8_activation * INT8_weight)
+relu_acc = max(acc, 0)
+activation_q = saturate_uint8(relu_acc >> SHIFT)
+```
+
+The Python exporter derives the INT8 weight scales and calibrated power-of-two output shifts, then writes the selected shifts to `rtl/quant_params.vh`. It also writes `weights/quantization.json` for the Python golden model.
+
+No overflowing value is silently truncated when converting a convolution result to UINT8; values above 255 saturate to 255.
+
+An INT8 HEX byte such as `FE` is loaded into `reg signed [7:0]` and therefore represents -2, not 254.
+
+The FC stage does not requantize its logits because only their ordering is required. It accumulates signed INT32 class scores and Argmax selects the largest.
+
+## 7. Padding and pooling
+
+Convolution is 3x3, stride 1, padding 1. Out-of-range source coordinates contribute zero and no invalid RAM address is generated.
+
+Max-pooling reads each 2x2 window sequentially and stores the maximum.
+
+## 8. Project files
+
+```text
+MNIST_CNN_FPGA/
+├── rtl/
+│   ├── mnist_cnn_top.v
+│   ├── conv_engine.v
+│   ├── pool_engine.v
+│   ├── fc_engine.v
+│   ├── argmax.v
+│   ├── sync_ram_1r1w.v
+│   └── quant_params.vh
+├── weights/
+│   └── README.md               # generated HEX files appear here
+├── test_images/
+│   └── README.md               # digit_0.hex ... digit_9.hex appear here
+├── python/
+│   ├── train_export_mnist.py
+│   └── verify_quantized_model.py
+├── simulation/
+│   ├── test_mnist_cnn.py
+│   ├── Makefile
+│   └── requirements.txt
+└── README.md
+```
+
+The controller is intentionally integrated into `mnist_cnn_top.v` so the number of RTL files stays small.
+
+## 9. Train and export real MNIST parameters
+
+Install dependencies:
+
+```bash
+python3 -m pip install -r simulation/requirements.txt
+```
+
+Train and export:
+
+```bash
+python3 python/train_export_mnist.py --epochs 3
+```
+
+The script downloads MNIST using torchvision, trains the exact 8/16-channel CNN, quantizes it, evaluates the integer model, then creates:
+
+```text
+weights/conv1_weights.hex
+weights/conv1_biases.hex
+weights/conv2_weights.hex
+weights/conv2_biases.hex
+weights/fc_weights.hex
+weights/fc_biases.hex
+weights/quantization.json
+weights/float_model_state.pt
+rtl/quant_params.vh
+test_images/digit_0.hex ... digit_9.hex
+test_images/labels.txt
+```
+
+The project does **not** include fake/random weight data as a substitute for training.
+
+## 10. Verify the quantized Python golden model
+
+```bash
+python3 python/verify_quantized_model.py --all --debug
+```
+
+It uses integer arithmetic in the same order as RTL and prints the first ten values of Conv1, Pool1, Conv2, Pool2, all FC scores, and the prediction.
+
+## 11. Cocotb simulation
+
+Install Icarus Verilog and Cocotb, then:
+
+```bash
+cd simulation
+make train            # only if artifacts have not been generated yet
+make verify           # Python integer golden model
+make SIM=icarus       # Cocotb + Icarus
+```
+
+Verilator can be selected when installed:
+
+```bash
+make SIM=verilator
+```
+
+The Cocotb test performs, for each digit 0..9:
+
+```text
+reset once
+write 784 pixels
+pulse start
+observe busy
+wait for done
+read predicted_digit + ten scores
+check expected class
+repeat without resetting the RTL
+```
+
+The default timeout is 900,000 clocks per inference. The low-resource sequential architecture is intentionally much slower than a highly parallel CNN.
+
+## 12. Waveforms
+
+Try:
+
+```bash
+make SIM=icarus WAVES=1
+```
+
+Cocotb/simulator versions may produce `dump.vcd` or `dump.fst`. Open the generated waveform with GTKWave, for example:
+
+```bash
+gtkwave dump.vcd
+```
+
+Useful signals include `clk`, `rst`, `pixel_valid`, `pixel_addr`, `start`, `busy`, `done`, `debug_state`, `debug_mac_acc`, stage start/done signals, RAM addresses, scores, and `predicted_digit`.
+
+Set:
+
+```bash
+DUMP_INTERMEDIATES=1 make SIM=icarus
+```
+
+and the Cocotb test will also attempt to read the first ten entries of each intermediate RAM. Whether unpacked memories are exposed hierarchically depends on the simulator.
+
+## 13. Vivado synthesis
+
+1. Run the training/export script first.
+2. Create a Vivado RTL project and add every `.v` file in `rtl/` plus `rtl/quant_params.vh`.
+3. Add the six generated HEX files to the Vivado project as memory initialization/support files.
+4. The engines call `$readmemh()` with the bare filenames such as `conv1_weights.hex`. Keep those files in Vivado's accessible synthesis/simulation working set.
+5. Set `mnist_cnn_top` as top.
+6. Add clock constraints for the intended board clock, for example 100 MHz.
+7. Run synthesis/implementation and inspect BRAM/DSP inference and timing.
+
+The image RAM is **not** initialized from a test image. In hardware, replace the simple pixel loading signals later with AXI4-Lite, AXI4-Stream, DMA, UART, SPI, PCIe, or a processor interface without changing the CNN memory/data organization.
+
+## 14. Practical resource/latency trade-off
+
+This reference design emphasizes correctness, low resource use, and readability. The main acceleration path is to process multiple taps or output channels in parallel and bank the memories accordingly. Do that only after this one-MAC baseline is passing bit-for-bit against the Python model.
+
+================================================================================
+
+FILE: VALIDATION.md
+EXPLANATION: What was and was not validated in the packaging environment.
+--------------------------------------------------------------------------------
+# Validation status
+
+Checks performed while packaging this project:
+
+- Python syntax compilation passed for:
+  - `python/train_export_mnist.py`
+  - `python/verify_quantized_model.py`
+  - `simulation/test_mnist_cnn.py`
+- A randomized arithmetic cross-check confirmed that the NumPy golden-model implementation of Conv -> ReLU -> shift -> saturation -> MaxPool matches the PyTorch integer-export math.
+- Required source-file presence and basic RTL structural checks passed.
+
+Checks not performed in the packaging environment:
+
+- MNIST training/export was not executed because the dataset is not present locally and the Python runtime has no network access.
+- Icarus Verilog and Verilator are not installed in the packaging environment, so RTL compilation/Cocotb simulation was not executed here.
+
+The project deliberately does not include fabricated/random model parameters. Run `python3 python/train_export_mnist.py` on a machine with MNIST download access to generate the trained HEX files and real MNIST test images, then run the Python golden model and Cocotb simulation.
+
+================================================================================
+

@@ -1,0 +1,49 @@
+venv/
+__pycache__/
+*.pyc
+simulation/sim_build/
+simulation/results.xml
+simulation/dump.vcd
+simulation/dump.fst
+simulation/blur_results/
+
+# Local environments and tooling
+.venv/
+env/
+.env
+.env.*
+*.env
+*.env.*
+.direnv/
+.aws/
+.ssh/
+.codex/
+.agents/
+.vscode/
+.idea/
+
+# Credentials, private keys, and local credential stores
+*credentials*
+*secrets*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.netrc
+.npmrc
+.pypirc
+
+# Downloaded datasets, caches, and generated simulator links
+data/
+.cache/
+.pytest_cache/
+*.vcd
+*.fst
+simulation/*_weights.hex
+simulation/*_biases.hex
+
+# OS files
+.DS_Store
+Thumbs.db
